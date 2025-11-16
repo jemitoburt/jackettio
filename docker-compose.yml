@@ -35,6 +35,7 @@ services:
     #   dockerfile: Dockerfile
     # Pro použití image z Docker Hubu odkomentujte řádek níže a zakomentujte build výše:
     image: jemitoburt/jackettio:latest
+    platform: linux/amd64
     container_name: jackettio
     env_file:
       - .env.production
