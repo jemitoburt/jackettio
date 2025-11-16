@@ -30,11 +30,11 @@ services:
 
   jackettio:
     # Pro lokální build použijte build místo image:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    # build:
+    #   context: .
+    #   dockerfile: Dockerfile
     # Pro použití image z Docker Hubu odkomentujte řádek níže a zakomentujte build výše:
-    # image: jemitoburt/jackettio:latest
+    image: jemitoburt/jackettio:latest
     container_name: jackettio
     env_file:
       - .env.production
