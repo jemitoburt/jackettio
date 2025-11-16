@@ -1,8 +1,8 @@
 import crypto from "crypto";
-import { Parser } from "xml2js";
 import config from "./config.js";
 import cache from "./cache.js";
 import { parseWords, promiseTimeout, bytesToSize } from "./util.js";
+import { jackettApi } from "./jackett.js";
 
 const CATEGORY = {
     MOVIE: 2000,
@@ -27,36 +27,64 @@ export async function searchCatalog(query, type) {
         return [];
     }
 
-    const category = type === "movie" ? CATEGORY.MOVIE : CATEGORY.SERIES;
-    const cacheKey = `jackettCatalog:${type}:${query.trim().toLowerCase()}`;
+    // API returns results together for both types, so we ignore type parameter
+    // and return results for both movie and series
+    const cacheKey = `jackettCatalog:all:${query.trim().toLowerCase()}`;
 
     // Check cache first
     let items = await cache.get(cacheKey);
 
     if (!items) {
         try {
-            // Search with timeout
-            const searchPromise = jackettCatalogApi(query.trim(), category);
+            // Search with timeout - no category filter since API returns all results together
+            const searchPromise = jackettCatalogApi(query.trim(), null);
             const res = await promiseTimeout(
                 searchPromise,
                 CATALOG_SEARCH_TIMEOUT
             );
 
             // Extract items from response
-            const rawItems = res?.rss?.channel?.item || [];
+            // The results endpoint returns JSON with Results array, or XML with rss.channel.item
+            let rawItems = [];
+            if (Array.isArray(res?.Results)) {
+                // JSON format from /api/v2.0/indexers/all/results
+                rawItems = res.Results;
+            } else if (Array.isArray(res?.rss?.channel?.item)) {
+                // XML format from torznab API
+                rawItems = res.rss.channel.item;
+            } else if (res?.Results) {
+                // Single item or other structure
+                rawItems = forceArray(res.Results);
+            }
 
-            // Normalize items for catalog
-            items = normalizeCatalogItems(rawItems, type).slice(
-                0,
-                MAX_CATALOG_RESULTS
-            ); // Limit results
+            // Normalize items for catalog - filter by requested type but include both types
+            // Since API returns results together, we filter by type only for display
+            const allItems = normalizeCatalogItemsMixed(rawItems);
+
+            // Filter by requested type if specified
+            if (type) {
+                items = allItems
+                    .filter((item) => item.type === type)
+                    .slice(0, MAX_CATALOG_RESULTS);
+            } else {
+                items = allItems.slice(0, MAX_CATALOG_RESULTS);
+            }
 
             // Cache results (shorter TTL for search results - 1 hour)
-            await cache.set(cacheKey, items, { ttl: 3600 });
+            await cache.set(cacheKey, allItems, { ttl: 3600 });
         } catch (err) {
             console.log(`Catalog search failed for "${query}": ${err.message}`);
             // Return empty array on error (will show empty catalog)
             return [];
+        }
+    } else {
+        // Filter cached results by type if specified
+        if (type) {
+            items = items
+                .filter((item) => item.type === type)
+                .slice(0, MAX_CATALOG_RESULTS);
+        } else {
+            items = items.slice(0, MAX_CATALOG_RESULTS);
         }
     }
 
@@ -65,48 +93,70 @@ export async function searchCatalog(query, type) {
 
 /**
  * Call Jackett API for catalog search
- * Uses the torznab API endpoint for consistency with existing code
+ * Uses the standard results endpoint: /api/v2.0/indexers/all/results
  * @param {string} query - Search query
- * @param {number} category - Category ID (MOVIE or SERIES)
+ * @param {number|null} category - Category ID (MOVIE or SERIES) - ignored since API returns all results together
  * @returns {Promise<Object>} Parsed API response
  */
 async function jackettCatalogApi(query, category) {
-    const params = new URLSearchParams({
-        t: "search",
-        cat: category,
-        q: query,
-    });
-    params.set("apikey", config.jackettApiKey);
+    // Use the standard results endpoint with Query parameter (capital Q)
+    // API returns results for both movies and series together, so we don't filter by category
+    // Reuse jackettApi function from jackett.js for consistent API handling
+    const res = await jackettApi(
+        "/api/v2.0/indexers/all/results",
+        { Query: query } // Note: capital Q as per Jackett API
+    );
 
-    const url = `${
-        config.jackettUrl
-    }/api/v2.0/indexers/all/results/torznab/api?${params.toString()}`;
+    return res;
+}
 
-    const res = await fetch(url);
+/**
+ * Normalize Jackett results to Stremio catalog format for mixed types
+ * Returns results for both movie and series, auto-detecting type
+ * @param {Array} items - Raw items from Jackett API
+ * @returns {Array} Array of Stremio catalog meta objects with type determined
+ */
+function normalizeCatalogItemsMixed(items) {
+    const normalized = [];
+    const seenIds = new Set(); // Deduplicate by ID
 
-    if (!res.ok) {
-        throw new Error(`Jackett API returned status ${res.status}`);
+    for (const item of forceArray(items)) {
+        try {
+            // Try to determine if item is movie or series
+            // First try as movie
+            let normalizedItem = normalizeToMeta(item, "movie");
+            let itemType = "movie";
+
+            // If it looks like a series (has episode patterns), use series type
+            if (
+                normalizedItem &&
+                (isSingleEpisode(normalizedItem.name) ||
+                    looksLikeSeries(normalizedItem.name))
+            ) {
+                normalizedItem = normalizeToMeta(item, "series");
+                itemType = "series";
+
+                // Skip single episodes for series catalog
+                if (isSingleEpisode(normalizedItem.name)) {
+                    continue;
+                }
+            }
+
+            // Skip if already seen or if item doesn't match type heuristics
+            if (normalizedItem && !seenIds.has(normalizedItem.id)) {
+                normalizedItem.type = itemType;
+                seenIds.add(normalizedItem.id);
+                normalized.push(normalizedItem);
+            }
+        } catch (err) {
+            // Skip items that fail normalization
+            console.log(`Failed to normalize catalog item: ${err.message}`);
+            continue;
+        }
     }
 
-    let data;
-    const contentType = res.headers.get("content-type") || "";
-
-    if (contentType.includes("application/json")) {
-        data = await res.json();
-    } else {
-        // Parse XML response (most common for torznab API)
-        const text = await res.text();
-        const parser = new Parser({ explicitArray: false, ignoreAttrs: false });
-        data = await parser.parseStringPromise(text);
-    }
-
-    if (data.error) {
-        throw new Error(
-            `Jackett API error: ${data.error?.$?.description || data.error}`
-        );
-    }
-
-    return data;
+    // Sort by seeders (descending) to prioritize popular content
+    return normalized.sort((a, b) => (b.seeders || 0) - (a.seeders || 0));
 }
 
 /**
@@ -151,25 +201,39 @@ function normalizeCatalogItems(items, type) {
  * @returns {Object|null} Stremio catalog meta object or null if invalid
  */
 function normalizeToMeta(item, type) {
-    // Merge dollar keys (XML attributes)
+    // Merge dollar keys (XML attributes) - only needed for XML format
     item = mergeDollarKeys(item);
 
-    // Extract torznab attributes
-    const attr = (item["torznab:attr"] || []).reduce((obj, attrItem) => {
-        if (attrItem && attrItem.name) {
-            obj[attrItem.name] = attrItem.value;
-        }
-        return obj;
-    }, {});
+    // Extract attributes - handle both JSON and XML formats
+    let attr = {};
+    if (item["torznab:attr"]) {
+        // XML format: extract from torznab:attr array
+        attr = (item["torznab:attr"] || []).reduce((obj, attrItem) => {
+            if (attrItem && attrItem.name) {
+                obj[attrItem.name] = attrItem.value;
+            }
+            return obj;
+        }, {});
+    } else {
+        // JSON format: attributes are directly on the object
+        // Map common attributes from JSON structure
+        if (item.Seeders !== undefined) attr.seeders = item.Seeders;
+        if (item.Peers !== undefined) attr.peers = item.Peers;
+        if (item.InfoHash !== undefined) attr.infohash = item.InfoHash;
+        if (item.Imdb !== undefined) attr.imdbid = item.Imdb;
+        if (item.MagnetUri !== undefined) attr.magneturl = item.MagnetUri;
+    }
 
-    const title = item.title || "";
+    // Get title - handle both JSON (Title) and XML (title) formats
+    const title = item.Title || item.title || "";
     if (!title) return null;
 
-    // Extract IMDb ID from title or attributes if present
+    // Extract IMDb ID from title, attributes, or direct Imdb field
     // Pattern: tt followed by 7-8 digits
     let imdbId = null;
+    const imdbSource = item.Imdb || attr.imdbid || title;
     const imdbMatch =
-        title.match(/tt\d{7,8}/i) || attr.imdbid?.match(/tt\d{7,8}/i);
+        typeof imdbSource === "string" ? imdbSource.match(/tt\d{7,8}/i) : null;
     if (imdbMatch) {
         imdbId = imdbMatch[0].toLowerCase();
     }
@@ -180,11 +244,12 @@ function normalizeToMeta(item, type) {
 
     // Generate stable ID
     // Prefer IMDb ID if found, otherwise use namespaced hash
+    const guid = item.Guid || item.guid || item.Link || item.link || title;
     const id =
         imdbId ||
         `jackett:${crypto
             .createHash("sha256")
-            .update(item.guid || item.link || title)
+            .update(guid)
             .digest("hex")
             .substring(0, 16)}`;
 
@@ -197,11 +262,17 @@ function normalizeToMeta(item, type) {
         .trim();
 
     // Build description with tracker info
+    // Handle both JSON (Tracker) and XML (jackettindexer) formats
     const trackerName =
-        item.jackettindexer?.title || item.jackettindexer?.id || "Unknown";
-    const size = bytesToSize(parseInt(item.size || 0));
+        item.Tracker ||
+        item.TrackerId ||
+        item.jackettindexer?.title ||
+        item.jackettindexer?.id ||
+        "Unknown";
+    const size = bytesToSize(parseInt(item.Size || item.size || 0));
     const seeders = parseInt(attr.seeders || 0);
-    const leechers = parseInt(attr.peers || 0) - seeders;
+    const peers = parseInt(attr.peers || item.Peers || 0);
+    const leechers = peers - seeders;
 
     const descriptionParts = [];
     if (trackerName)
@@ -228,6 +299,27 @@ function normalizeToMeta(item, type) {
         _year: year,
         _tracker: trackerName,
     };
+}
+
+/**
+ * Check if a title looks like a series (not a movie)
+ * @param {string} title - Item title
+ * @returns {boolean} True if appears to be a series
+ */
+function looksLikeSeries(title) {
+    const titleLower = title.toLowerCase();
+
+    // Patterns that indicate series
+    const seriesPatterns = [
+        /\bS\d{1,2}\b/, // Season pattern (S01, S1, etc.)
+        /\bSeason\s+\d+\b/i, // "Season X"
+        /\bSeries\s+\d+\b/i, // "Series X"
+        /\bComplete\s+Series\b/i, // "Complete Series"
+        /\bBox\s+Set\b/i, // "Box Set"
+        /\bComplete\s+Collection\b/i, // "Complete Collection"
+    ];
+
+    return seriesPatterns.some((pattern) => pattern.test(titleLower));
 }
 
 /**

@@ -70,7 +70,23 @@ app.use((req, res, next) => {
     next();
 });
 
+// CORS middleware for all routes
+app.use((req, res, next) => {
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
+    res.setHeader("Access-Control-Allow-Headers", "*");
+    res.setHeader("Access-Control-Max-Age", "86400");
+
+    // Handle preflight requests
+    if (req.method === "OPTIONS") {
+        return res.status(204).end();
+    }
+
+    next();
+});
+
 app.use(compression());
+
 app.use(
     express.static(path.join(import.meta.dirname, "static"), {
         maxAge: 86400e3,
@@ -164,14 +180,6 @@ app.get("/:userConfig?/manifest.json", async (req, res) => {
                 genres: [],
                 styles: ["search"],
             },
-            {
-                id: "jackett-search-series",
-                type: "series",
-                name: "Jackett Search",
-                extra: [{ name: "search", isRequired: true }],
-                genres: [],
-                styles: ["search"],
-            },
         ],
         behaviorHints: { configurable: true },
     };
@@ -216,48 +224,50 @@ app.get("/stream/:type/:id.json", async (req, res) => {
 });
 
 // Catalog endpoints for Jackett search
-// GET /catalog/:type/jackett-search/:search.json
-// GET /catalog/:type/jackett-search-series/:search.json
-app.get("/catalog/:type/:catalogId/:search.json", async (req, res) => {
+// GET /:userConfig?/catalog/:type/:id/* (wildcard pattern to handle search=term.json)
+// Handles: /catalog/movie/jackett-search/search=Bachelor.json
+// Returns all results (movies and series together) in one catalog
+app.get("/:userConfig?/catalog/:type/:id/*", async (req, res) => {
     try {
-        const { type, catalogId, search } = req.params;
+        const { type, id } = req.params;
+        const extraPath = req.params[0]; // Wildcard match
 
-        // Validate type
-        if (type !== "movie" && type !== "series") {
+        // Parsování extra argumentů z URL cesty
+        let searchTerm = null;
+
+        // Zkusíme extrahovat search parametr z cesty
+        // Formát: search=Bachelor.json nebo search=Bachelor
+        if (extraPath && extraPath.includes("search=")) {
+            const searchMatch = extraPath.match(/search=([^&.]+)/);
+            if (searchMatch) {
+                searchTerm = decodeURIComponent(searchMatch[1]).trim();
+            }
+        }
+
+        // Fallback: zkusíme query parametr
+        if (!searchTerm && req.query.search) {
+            searchTerm = decodeURIComponent(req.query.search || "").trim();
+        }
+
+        // Pokud nemáme search term, vrátíme prázdný seznam
+        if (!searchTerm) {
             return respond(res, { metas: [] });
         }
 
-        // Validate catalog ID matches expected values
-        const isMovieCatalog = catalogId === "jackett-search";
-        const isSeriesCatalog = catalogId === "jackett-search-series";
+        console.log(
+            `Catalog search for "${searchTerm}" (type: ${type}, catalog: ${id})`
+        );
 
-        if (!isMovieCatalog && !isSeriesCatalog) {
-            return respond(res, { metas: [] });
-        }
+        // Search Jackett catalog - return ALL results (movies and series together)
+        // Pass null as type to get all results without filtering
+        const items = await jackettCatalog.searchCatalog(searchTerm, null);
 
-        // Validate type matches catalog
-        if (
-            (type === "movie" && !isMovieCatalog) ||
-            (type === "series" && !isSeriesCatalog)
-        ) {
-            return respond(res, { metas: [] });
-        }
-
-        // Decode search parameter (URL-encoded)
-        const searchTerm = decodeURIComponent(search || "").trim();
-
-        // Validate search term (minimum 2 characters)
-        if (!searchTerm || searchTerm.length < 2) {
-            return respond(res, { metas: [] });
-        }
-
-        // Search Jackett catalog
-        const items = await jackettCatalog.searchCatalog(searchTerm, type);
+        console.log(`Catalog search completed: ${items.length} results found`);
 
         // Return Stremio catalog format
         return respond(res, { metas: items });
     } catch (err) {
-        console.log(`Catalog search error for "${req.params.search}":`, err);
+        console.log(`Catalog search error:`, err);
 
         // Return empty catalog on error
         return respond(res, { metas: [] });
