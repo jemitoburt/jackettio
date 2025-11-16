@@ -40,7 +40,7 @@ Three automatic installation options are available using cli script:
 mkdir /home/jackettio && cd /home/jackettio
 
 # Download the cli script
-curl -fsSL https://raw.githubusercontent.com/arvida42/jackettio/master/cli.sh -o cli.sh
+curl -fsSL https://raw.githubusercontent.com/jemitoburt/jackettio/master/cli.sh -o cli.sh
 
 # Run the install
 chmod +x ./cli.sh && ./cli.sh install
