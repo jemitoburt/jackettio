@@ -1,4 +1,3 @@
-version: "3.3"
 name: jackettio
 services:
 
@@ -29,7 +28,9 @@ services:
       - jackett-downloads:/downloads
 
   jackettio:
-    image: jemitoburt/jackettio:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
     container_name: jackettio
     env_file:
       - .env.production
