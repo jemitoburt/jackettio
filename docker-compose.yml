@@ -29,13 +29,7 @@ services:
       - jackett-downloads:/downloads
 
   jackettio:
-    # Pro lokální build použijte build místo image:
-    # build:
-    #   context: .
-    #   dockerfile: Dockerfile
-    # Pro použití image z Docker Hubu odkomentujte řádek níže a zakomentujte build výše:
     image: jemitoburt/jackettio:latest
-    platform: linux/amd64
     container_name: jackettio
     env_file:
       - .env.production

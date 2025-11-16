@@ -13,10 +13,9 @@ import path from "path";
 import * as meta from "./lib/meta.js";
 import * as icon from "./lib/icon.js";
 import * as debrid from "./lib/debrid.js";
-import { getIndexers } from "./lib/jackett.js";
+import { getIndexers, searchAllTorrents } from "./lib/jackett.js";
 import * as jackettio from "./lib/jackettio.js";
 import { cleanTorrentFolder, createTorrentFolder } from "./lib/torrentInfos.js";
-import * as jackettCatalog from "./lib/jackettCatalog.js";
 
 const converter = new showdown.Converter();
 const welcomeMessageHtml = config.welcomeMessage
@@ -32,6 +31,66 @@ const respond = (res, data) => {
     res.setHeader("Access-Control-Allow-Headers", "*");
     res.setHeader("Content-Type", "application/json");
     res.send(data);
+};
+
+const convertToMetas = (torrents, type) => {
+    const metas = [];
+    const seenIds = new Set();
+
+    for (const torrent of torrents) {
+        let id = torrent.imdb;
+
+        // If no IMDB ID, create a unique ID from the torrent name
+        if (!id || id === "null" || id === "") {
+            // Use first 9 chars of torrent ID as unique identifier
+            id = `jkt${torrent.id.substring(0, 9)}`;
+        }
+
+        // Clean up IMDB ID if it exists
+        if (id.startsWith("tt")) {
+            id = id.toLowerCase();
+        }
+
+        // Skip if we've already added this ID
+        if (seenIds.has(id)) {
+            continue;
+        }
+        seenIds.add(id);
+
+        // Determine type from category or use provided type
+        let metaType = type;
+        if (torrent.type && torrent.type.toLowerCase().includes("movie")) {
+            metaType = "movie";
+        } else if (
+            torrent.type &&
+            (torrent.type.toLowerCase().includes("tv") ||
+                torrent.type.toLowerCase().includes("series"))
+        ) {
+            metaType = "series";
+        }
+
+        const meta = {
+            id: id,
+            type: metaType,
+            name: torrent.name,
+        };
+
+        if (torrent.poster && torrent.poster.startsWith("http")) {
+            meta.poster = torrent.poster;
+        }
+
+        if (torrent.year && torrent.year > 1900) {
+            meta.releaseInfo = torrent.year.toString();
+        }
+
+        if (torrent.genres && torrent.genres.length > 0) {
+            meta.genres = torrent.genres;
+        }
+
+        metas.push(meta);
+    }
+
+    return metas;
 };
 
 const limiter = rateLimit({
@@ -70,23 +129,7 @@ app.use((req, res, next) => {
     next();
 });
 
-// CORS middleware for all routes
-app.use((req, res, next) => {
-    res.setHeader("Access-Control-Allow-Origin", "*");
-    res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
-    res.setHeader("Access-Control-Allow-Headers", "*");
-    res.setHeader("Access-Control-Max-Age", "86400");
-
-    // Handle preflight requests
-    if (req.method === "OPTIONS") {
-        return res.status(204).end();
-    }
-
-    next();
-});
-
 app.use(compression());
-
 app.use(
     express.static(path.join(import.meta.dirname, "static"), {
         maxAge: 86400e3,
@@ -168,17 +211,15 @@ app.get("/:userConfig?/manifest.json", async (req, res) => {
         icon: `${req.hostname == "localhost" ? "http" : "https"}://${
             req.hostname
         }/icon`,
-        resources: ["stream"],
+        resources: ["stream", "catalog"],
         types: ["movie", "series"],
         idPrefixes: ["tt"],
         catalogs: [
             {
+                types: ["movie", "series"],
                 id: "jackett-search",
-                type: "movie",
                 name: "Jackett Search",
                 extra: [{ name: "search", isRequired: true }],
-                genres: [],
-                styles: ["search"],
             },
         ],
         behaviorHints: { configurable: true },
@@ -189,6 +230,53 @@ app.get("/:userConfig?/manifest.json", async (req, res) => {
         manifest.name += ` ${debridInstance.shortName}`;
     }
     respond(res, manifest);
+});
+
+app.get("/:userConfig?/catalog/:type/:id.json", async (req, res) => {
+    try {
+        const searchQuery = req.query.search;
+
+        if (!searchQuery) {
+            return respond(res, { metas: [] });
+        }
+
+        let userConfig = config.defaultUserConfig;
+        if (req.params.userConfig) {
+            userConfig = {
+                ...userConfig,
+                ...JSON.parse(atob(req.params.userConfig)),
+            };
+        }
+
+        const indexers = userConfig.indexers || ["all"];
+        const qualities = userConfig.qualities || [0, 720, 1080, 2160];
+
+        // Search through configured indexers
+        const searchPromises = indexers.map((indexer) =>
+            searchAllTorrents({ indexer, query: searchQuery }).catch(() => [])
+        );
+
+        const results = await Promise.all(searchPromises);
+        const allTorrents = [].concat(...results);
+
+        // Filter by quality preferences
+        const filteredTorrents = allTorrents.filter((torrent) =>
+            qualities.includes(torrent.quality)
+        );
+
+        // Convert to Stremio meta objects
+        const metas = convertToMetas(filteredTorrents, req.params.type);
+
+        // Remove duplicates by ID and limit results
+        const uniqueMetas = Array.from(
+            new Map(metas.map((meta) => [meta.id, meta])).values()
+        ).slice(0, 100);
+
+        respond(res, { metas: uniqueMetas });
+    } catch (err) {
+        console.log("Catalog error:", err);
+        respond(res, { metas: [] });
+    }
 });
 
 app.get("/:userConfig/stream/:type/:id.json", limiter, async (req, res) => {
@@ -221,57 +309,6 @@ app.get("/stream/:type/:id.json", async (req, res) => {
             },
         ],
     });
-});
-
-// Catalog endpoints for Jackett search
-// GET /:userConfig?/catalog/:type/:id/* (wildcard pattern to handle search=term.json)
-// Handles: /catalog/movie/jackett-search/search=Bachelor.json
-// Returns all results (movies and series together) in one catalog
-app.get("/:userConfig?/catalog/:type/:id/*", async (req, res) => {
-    try {
-        const { type, id } = req.params;
-        const extraPath = req.params[0]; // Wildcard match
-
-        // Parsování extra argumentů z URL cesty
-        let searchTerm = null;
-
-        // Zkusíme extrahovat search parametr z cesty
-        // Formát: search=Bachelor.json nebo search=Bachelor
-        if (extraPath && extraPath.includes("search=")) {
-            const searchMatch = extraPath.match(/search=([^&.]+)/);
-            if (searchMatch) {
-                searchTerm = decodeURIComponent(searchMatch[1]).trim();
-            }
-        }
-
-        // Fallback: zkusíme query parametr
-        if (!searchTerm && req.query.search) {
-            searchTerm = decodeURIComponent(req.query.search || "").trim();
-        }
-
-        // Pokud nemáme search term, vrátíme prázdný seznam
-        if (!searchTerm) {
-            return respond(res, { metas: [] });
-        }
-
-        console.log(
-            `Catalog search for "${searchTerm}" (type: ${type}, catalog: ${id})`
-        );
-
-        // Search Jackett catalog - return ALL results (movies and series together)
-        // Pass null as type to get all results without filtering
-        const items = await jackettCatalog.searchCatalog(searchTerm, null);
-
-        console.log(`Catalog search completed: ${items.length} results found`);
-
-        // Return Stremio catalog format
-        return respond(res, { metas: items });
-    } catch (err) {
-        console.log(`Catalog search error:`, err);
-
-        // Return empty catalog on error
-        return respond(res, { metas: [] });
-    }
 });
 
 app.use(

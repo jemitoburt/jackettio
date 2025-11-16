@@ -92,6 +92,38 @@ export async function searchEpisodeTorrents({
     return normalizeItems(items);
 }
 
+export async function searchAllTorrents({ indexer, query }) {
+    indexer = indexer || "all";
+    const cacheKey = `jackettItems:2:search:${indexer}:${query}`;
+    let items = await cache.get(cacheKey);
+
+    if (!items) {
+        const params = new URLSearchParams({ Query: query });
+        params.set("apikey", config.jackettApiKey);
+
+        const url = `${
+            config.jackettUrl
+        }/api/v2.0/indexers/${indexer}/results?${params.toString()}`;
+
+        const res = await fetch(url);
+        const data = await res.json();
+
+        if (data.error) {
+            throw new Error(
+                `jackettApi: ${url.replace(
+                    /apikey=[a-z0-9\-]+/,
+                    "apikey=****"
+                )} : ${data.error}`
+            );
+        }
+
+        items = data?.Results || [];
+        cache.set(cacheKey, items, { ttl: items.length > 0 ? 3600 * 36 : 60 });
+    }
+
+    return normalizeJsonItems(items);
+}
+
 export async function getIndexers() {
     const res = await jackettApi("/api/v2.0/indexers/all/results/torznab/api", {
         t: "indexers",
@@ -101,7 +133,7 @@ export async function getIndexers() {
     return normalizeIndexers(res?.indexers?.indexer || []);
 }
 
-export async function jackettApi(path, query) {
+async function jackettApi(path, query) {
     const params = new URLSearchParams(query || {});
     params.set("apikey", config.jackettApiKey);
 
@@ -158,6 +190,41 @@ function normalizeItems(items) {
             languages: config.languages.filter((lang) =>
                 title.match(lang.pattern)
             ),
+        };
+    });
+}
+
+function normalizeJsonItems(items) {
+    return forceArray(items).map((item) => {
+        const quality = item.Title.match(/(2160|1080|720|480|360)p/);
+        const title = parseWords(item.Title).join(" ");
+        const year =
+            item.Year ||
+            (
+                item.Title.replace(quality ? quality[1] : "", "").match(
+                    /(19|20[\d]{2})/
+                ) || []
+            ).pop();
+        return {
+            name: item.Title,
+            guid: item.Guid,
+            indexerId: item.TrackerId,
+            id: crypto.createHash("sha1").update(item.Guid).digest("hex"),
+            size: parseInt(item.Size || 0),
+            link: item.Link,
+            seeders: parseInt(item.Seeders || 0),
+            peers: parseInt(item.Peers || 0),
+            infoHash: item.InfoHash || "",
+            magneturl: item.MagnetUri || "",
+            type: item.CategoryDesc,
+            quality: quality ? parseInt(quality[1]) : 0,
+            year: year ? parseInt(year) : 0,
+            languages: config.languages.filter((lang) =>
+                title.match(lang.pattern)
+            ),
+            imdb: item.Imdb || null,
+            poster: item.Poster || null,
+            genres: item.Genres || [],
         };
     });
 }
