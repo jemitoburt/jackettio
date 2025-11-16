@@ -36,7 +36,15 @@ importConfig() {
         echo "Are you in the corect folder to run this command ?"
         exit 1
     fi
-    source $ENV_FILE
+    # Ensure file is readable
+    if [ ! -r "$ENV_FILE" ]; then
+        echo "Configuration file is not readable: $ENV_FILE"
+        echo "Fixing permissions..."
+        chmod 644 "$ENV_FILE"
+    fi
+    set -a
+    source "$ENV_FILE"
+    set +a
 }
 
 runDockerCompose() {
@@ -112,6 +120,7 @@ JACKETT_API_KEY=$JACKETT_API_KEY
 PORT=$PORT
 COMPOSE_FILE=$COMPOSE_FILE
 EOF
+chmod 644 $ENV_FILE
 }
 
 case "$COMMAND" in
