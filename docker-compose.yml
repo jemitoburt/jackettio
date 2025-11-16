@@ -29,7 +29,7 @@ services:
       - jackett-downloads:/downloads
 
   jackettio:
-    image: arvida42/jackettio:latest
+    image: jemitoburt/jackettio:latest
     container_name: jackettio
     env_file:
       - .env.production
