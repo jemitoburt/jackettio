@@ -216,7 +216,7 @@ app.get("/:userConfig?/manifest.json", async (req, res) => {
         idPrefixes: ["tt"],
         catalogs: [
             {
-                types: ["movie", "series"],
+                type: "movie",
                 id: "jackett-search",
                 name: "Jackett Search",
                 extra: [{ name: "search", isRequired: true }],
