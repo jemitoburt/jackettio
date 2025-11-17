@@ -190,6 +190,7 @@ function normalizeItems(items) {
             languages: config.languages.filter((lang) =>
                 title.match(lang.pattern)
             ),
+            publishDate: item.pubDate ? new Date(item.pubDate).getTime() : 0,
         };
     });
 }
@@ -225,6 +226,9 @@ function normalizeJsonItems(items) {
             imdb: item.Imdb || null,
             poster: item.Poster || null,
             genres: item.Genres || [],
+            publishDate: item.PublishDate
+                ? new Date(item.PublishDate).getTime()
+                : 0,
         };
     });
 }

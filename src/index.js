@@ -15,7 +15,13 @@ import * as icon from "./lib/icon.js";
 import * as debrid from "./lib/debrid.js";
 import { getIndexers, searchAllTorrents } from "./lib/jackett.js";
 import * as jackettio from "./lib/jackettio.js";
-import { cleanTorrentFolder, createTorrentFolder } from "./lib/torrentInfos.js";
+import {
+    cleanTorrentFolder,
+    createTorrentFolder,
+    get as getTorrentInfos,
+    getById as getTorrentInfoById,
+} from "./lib/torrentInfos.js";
+import { bytesToSize } from "./lib/util.js";
 
 const converter = new showdown.Converter();
 const welcomeMessageHtml = config.welcomeMessage
@@ -33,7 +39,10 @@ const respond = (res, data) => {
     res.send(data);
 };
 
-const convertToMetas = (torrents, type) => {
+// Store torrents for meta endpoint
+const torrentMetaStore = new Map();
+
+const convertToMetas = (torrents, type, publicUrl) => {
     const metas = [];
     const seenIds = new Set();
 
@@ -69,14 +78,34 @@ const convertToMetas = (torrents, type) => {
             metaType = "series";
         }
 
+        // Fix poster URL - proxy through our server for external access
+        let posterUrl = null;
+        if (torrent.poster && torrent.poster.startsWith("http")) {
+            // Parse original Jackett URL
+            // Example: http://192.168.1.110:9117/img/sktorrent/?jackett_apikey=xxx&path=yyy&file=poster
+            const urlMatch = torrent.poster.match(/\/img\/([^/]+)\/\?(.+)/);
+            if (urlMatch && publicUrl) {
+                const indexer = urlMatch[1];
+                const params = urlMatch[2];
+                // Proxy through our server so it works from anywhere
+                posterUrl = `${publicUrl}/jackett-proxy/img/${indexer}/?${params}`;
+            } else {
+                // Fallback to original URL if pattern doesn't match
+                posterUrl = torrent.poster.replace(
+                    /http:\/\/jackett:9117/g,
+                    config.jackettUrl
+                );
+            }
+        }
+
         const meta = {
             id: id,
             type: metaType,
-            name: torrent.name,
+            name: `[${torrent.indexerId}] ${torrent.name}`,
         };
 
-        if (torrent.poster && torrent.poster.startsWith("http")) {
-            meta.poster = torrent.poster;
+        if (posterUrl) {
+            meta.poster = posterUrl;
         }
 
         if (torrent.year && torrent.year > 1900) {
@@ -87,6 +116,30 @@ const convertToMetas = (torrents, type) => {
             meta.genres = torrent.genres;
         }
 
+        // Store full torrent data for meta and stream endpoints
+        torrentMetaStore.set(id, {
+            ...meta,
+            description: torrent.genres ? torrent.genres.join(", ") : "",
+            background: posterUrl,
+            // Add stream info
+            size: torrent.size,
+            seeders: torrent.seeders,
+            indexerId: torrent.indexerId,
+            quality: torrent.quality,
+            languages: torrent.languages || [],
+            // Store original torrent data and link for streaming
+            _torrent: torrent,
+            _torrentId: torrent.id, // Explicitly store torrent ID (SHA1 hash of GUID)
+            _torrentName: torrent.name, // Store raw torrent name (includes extension like .mkv)
+            _link: torrent.link, // Original Jackett download link
+            _guid: torrent.guid,
+            _infoHash: torrent.infoHash,
+            _magnetUrl: torrent.magneturl,
+            publishDate: torrent.publishDate || 0, // Store publish date for sorting
+        });
+
+        // Add publishDate to meta for sorting
+        meta.publishDate = torrent.publishDate || 0;
         metas.push(meta);
     }
 
@@ -121,6 +174,8 @@ const limiter = rateLimit({
 
 app.set("trust proxy", config.trustProxy);
 
+// Middleware: Extract and set client IP address from request
+// Handles Cloudflare proxy by checking CF-Connecting-IP header
 app.use((req, res, next) => {
     req.clientIp = req.ip;
     if (req.get("CF-Connecting-IP")) {
@@ -129,7 +184,11 @@ app.use((req, res, next) => {
     next();
 });
 
+// Middleware: Enable gzip/deflate compression for all responses
 app.use(compression());
+
+// Middleware: Serve static files from the 'static' directory (CSS, images, videos, etc.)
+// Files are cached for 24 hours (86400e3 ms) to improve performance
 app.use(
     express.static(path.join(import.meta.dirname, "static"), {
         maxAge: 86400e3,
@@ -148,6 +207,41 @@ app.get("/icon", async (req, res) => {
     return res.sendFile(filePath);
 });
 
+// Proxy endpoint for Jackett images (posters)
+app.get("/jackett-proxy/img/:indexer/", async (req, res) => {
+    try {
+        const jackettApiKey = req.query.jackett_apikey;
+        const path = req.query.path;
+        const file = req.query.file;
+
+        if (!jackettApiKey || !path || !file) {
+            return res.status(400).send("Missing parameters");
+        }
+
+        const url = `${config.jackettUrl}/img/${req.params.indexer}/?jackett_apikey=${jackettApiKey}&path=${path}&file=${file}`;
+
+        const response = await fetch(url);
+        if (!response.ok) {
+            return res.status(response.status).send("Failed to fetch image");
+        }
+
+        const imageBuffer = await response.arrayBuffer();
+        const buffer = Buffer.from(imageBuffer);
+
+        res.setHeader(
+            "Content-Type",
+            response.headers.get("content-type") || "image/jpeg"
+        );
+        res.setHeader("Cache-Control", "public, max-age=86400");
+        res.send(buffer);
+    } catch (err) {
+        console.error("Jackett proxy error:", err);
+        res.status(500).send("Error fetching image");
+    }
+});
+
+// Middleware: Log all incoming requests to console
+// Masks base64-encoded user config in URLs for security (replaces with asterisks)
 app.use((req, res, next) => {
     console.log(
         `${req.method} ${req.path.replace(
@@ -211,12 +305,18 @@ app.get("/:userConfig?/manifest.json", async (req, res) => {
         icon: `${req.hostname == "localhost" ? "http" : "https"}://${
             req.hostname
         }/icon`,
-        resources: ["stream", "catalog"],
+        resources: ["stream", "catalog", "meta"],
         types: ["movie", "series"],
-        idPrefixes: ["tt"],
+        idPrefixes: ["tt", "jkt"],
         catalogs: [
             {
                 type: "movie",
+                id: "jackett-search",
+                name: "Jackett Search",
+                extra: [{ name: "search", isRequired: true }],
+            },
+            {
+                type: "series",
                 id: "jackett-search",
                 name: "Jackett Search",
                 extra: [{ name: "search", isRequired: true }],
@@ -232,9 +332,21 @@ app.get("/:userConfig?/manifest.json", async (req, res) => {
     respond(res, manifest);
 });
 
-app.get("/:userConfig?/catalog/:type/:id.json", async (req, res) => {
+// Catalog endpoint with extra parameters in path (Stremio format)
+app.get("/:userConfig?/catalog/:type/:id/:extra.json", async (req, res) => {
     try {
-        const searchQuery = req.query.search;
+        // Parse extra parameters from path (e.g., "search=Bachelor")
+        const extraParams = req.params.extra.split("&").reduce((acc, param) => {
+            const [key, value] = param.split("=");
+            if (key && value) acc[key] = decodeURIComponent(value);
+            return acc;
+        }, {});
+
+        const searchQuery = extraParams.search || req.query.search;
+
+        console.log(
+            `Catalog request: type=${req.params.type}, id=${req.params.id}, search=${searchQuery}`
+        );
 
         if (!searchQuery) {
             return respond(res, { metas: [] });
@@ -264,14 +376,40 @@ app.get("/:userConfig?/catalog/:type/:id.json", async (req, res) => {
             qualities.includes(torrent.quality)
         );
 
+        // Build public URL for proxying posters
+        const publicUrl = `${
+            req.hostname == "localhost" ? "http" : "https"
+        }://${req.hostname}`;
+
         // Convert to Stremio meta objects
-        const metas = convertToMetas(filteredTorrents, req.params.type);
+        const metas = convertToMetas(
+            filteredTorrents,
+            req.params.type,
+            publicUrl
+        );
 
-        // Remove duplicates by ID and limit results
-        const uniqueMetas = Array.from(
-            new Map(metas.map((meta) => [meta.id, meta])).values()
-        ).slice(0, 100);
+        // Filter by catalog type (movie or series)
+        const typedMetas = metas.filter(
+            (meta) => meta.type === req.params.type
+        );
 
+        // Remove duplicates by ID while preserving order (keep first occurrence)
+        const seenIds = new Set();
+        const uniqueMetas = typedMetas
+            .filter((meta) => {
+                if (seenIds.has(meta.id)) {
+                    return false;
+                }
+                seenIds.add(meta.id);
+                return true;
+            })
+            // Sort by PublishDate (newest first)
+            .sort((a, b) => (b.publishDate || 0) - (a.publishDate || 0))
+            .slice(0, 100);
+
+        console.log(
+            `Catalog results: found ${uniqueMetas.length} metas for "${searchQuery}"`
+        );
         respond(res, { metas: uniqueMetas });
     } catch (err) {
         console.log("Catalog error:", err);
@@ -279,8 +417,218 @@ app.get("/:userConfig?/catalog/:type/:id.json", async (req, res) => {
     }
 });
 
+// Fallback catalog endpoint with query parameters
+app.get("/:userConfig?/catalog/:type/:id.json", async (req, res) => {
+    try {
+        const searchQuery = req.query.search;
+
+        console.log(
+            `Catalog request (query): type=${req.params.type}, id=${req.params.id}, search=${searchQuery}`
+        );
+
+        if (!searchQuery) {
+            return respond(res, { metas: [] });
+        }
+
+        let userConfig = config.defaultUserConfig;
+        if (req.params.userConfig) {
+            userConfig = {
+                ...userConfig,
+                ...JSON.parse(atob(req.params.userConfig)),
+            };
+        }
+
+        const indexers = userConfig.indexers || ["all"];
+        const qualities = userConfig.qualities || [0, 720, 1080, 2160];
+
+        // Search through configured indexers
+        const searchPromises = indexers.map((indexer) =>
+            searchAllTorrents({ indexer, query: searchQuery }).catch(() => [])
+        );
+
+        const results = await Promise.all(searchPromises);
+        const allTorrents = [].concat(...results);
+
+        // Filter by quality preferences
+        const filteredTorrents = allTorrents.filter((torrent) =>
+            qualities.includes(torrent.quality)
+        );
+
+        // Build public URL for proxying posters
+        const publicUrl = `${
+            req.hostname == "localhost" ? "http" : "https"
+        }://${req.hostname}`;
+
+        // Convert to Stremio meta objects
+        const metas = convertToMetas(
+            filteredTorrents,
+            req.params.type,
+            publicUrl
+        );
+
+        // Filter by catalog type (movie or series)
+        const typedMetas = metas.filter(
+            (meta) => meta.type === req.params.type
+        );
+
+        // Remove duplicates by ID while preserving order (keep first occurrence)
+        const seenIds = new Set();
+        const uniqueMetas = typedMetas
+            .filter((meta) => {
+                if (seenIds.has(meta.id)) {
+                    return false;
+                }
+                seenIds.add(meta.id);
+                return true;
+            })
+            // Sort by PublishDate (newest first)
+            .sort((a, b) => (b.publishDate || 0) - (a.publishDate || 0))
+            .slice(0, 100);
+
+        console.log(
+            `Catalog results: found ${uniqueMetas.length} metas for "${searchQuery}"`
+        );
+        respond(res, { metas: uniqueMetas });
+    } catch (err) {
+        console.log("Catalog error:", err);
+        respond(res, { metas: [] });
+    }
+});
+
+// Meta endpoint - provide metadata for items from catalog
+app.get("/:userConfig?/meta/:type/:id.json", async (req, res) => {
+    try {
+        const id = req.params.id;
+
+        console.log(`Meta request: type=${req.params.type}, id=${id}`);
+
+        // Check if we have this meta in store
+        const storedMeta = torrentMetaStore.get(id);
+
+        if (storedMeta) {
+            console.log(`Meta found in store for ${id}`);
+
+            // Build description with torrent info
+            const infoLines = [];
+            if (storedMeta.description) {
+                infoLines.push(storedMeta.description);
+            }
+
+            // Add stream-like info
+            const streamInfo = [
+                `💾${bytesToSize(storedMeta.size || 0)}`,
+                `👥${storedMeta.seeders || 0}`,
+                `⚙️${storedMeta.indexerId || "unknown"}`,
+                ...(storedMeta.languages || []).map(
+                    (language) => language.emoji
+                ),
+            ].join(" ");
+            infoLines.push(streamInfo);
+
+            const metaWithInfo = {
+                ...storedMeta,
+                description: infoLines.join("\n"),
+            };
+
+            // Remove internal fields
+            delete metaWithInfo._torrent;
+            delete metaWithInfo.size;
+            delete metaWithInfo.seeders;
+            delete metaWithInfo.indexerId;
+            delete metaWithInfo.quality;
+            delete metaWithInfo.languages;
+            delete metaWithInfo.torrentId;
+
+            return respond(res, { meta: metaWithInfo });
+        }
+
+        // If not in store, return basic meta structure
+        console.log(`Meta not found in store for ${id}`);
+        respond(res, {
+            meta: {
+                id: id,
+                type: req.params.type,
+                name: id,
+            },
+        });
+    } catch (err) {
+        console.log("Meta error:", err);
+        respond(res, {
+            meta: {
+                id: req.params.id,
+                type: req.params.type,
+                name: req.params.id,
+            },
+        });
+    }
+});
+
 app.get("/:userConfig/stream/:type/:id.json", limiter, async (req, res) => {
     try {
+        const id = req.params.id;
+
+        // Check if this is a jkt ID (from our catalog search)
+        if (id.startsWith("jkt")) {
+            console.log(`Stream request for catalog item: ${id}`);
+
+            const storedMeta = torrentMetaStore.get(id);
+            if (storedMeta && storedMeta._link) {
+                const userConfig = JSON.parse(atob(req.params.userConfig));
+                const debridInstance = debrid.instance(userConfig);
+                const publicUrl = `${
+                    req.hostname == "localhost" ? "http" : "https"
+                }://${req.hostname}`;
+
+                // Build quality label
+                const quality =
+                    storedMeta.quality > 0
+                        ? config.qualities.find(
+                              (q) => q.value == storedMeta.quality
+                          )?.label || ""
+                        : "";
+
+                // Build stream info
+                const streamInfo = [
+                    `💾${bytesToSize(storedMeta.size || 0)}`,
+                    `👥${storedMeta.seeders || 0}`,
+                    `⚙️${storedMeta.indexerId || "unknown"}`,
+                    ...(storedMeta.languages || []).map(
+                        (language) => language.emoji
+                    ),
+                ].join(" ");
+
+                // Generate download URL using torrent ID (same format as IMDB flow)
+                const torrentId =
+                    storedMeta._torrentId || storedMeta._torrent?.id;
+                if (!torrentId) {
+                    console.error(`No torrent ID found for custom meta ${id}`);
+                    return respond(res, { streams: [] });
+                }
+
+                // Use raw torrent name (includes extension) instead of formatted meta name
+                const fileName =
+                    storedMeta._torrentName ||
+                    storedMeta._torrent?.name ||
+                    storedMeta.name;
+
+                const stream = {
+                    name: `[${debridInstance.shortName}] ${config.addonName} ${quality}`,
+                    title: `${storedMeta.name}\n${streamInfo}`,
+                    url: `${publicUrl}/${btoa(
+                        JSON.stringify(userConfig)
+                    )}/download/${
+                        req.params.type
+                    }/${id}/${torrentId}/${encodeURIComponent(fileName)}`,
+                };
+
+                return respond(res, { streams: [stream] });
+            } else {
+                console.log(`Torrent not found in store for ${id}`);
+                return respond(res, { streams: [] });
+            }
+        }
+
+        // Standard flow for IMDB IDs
         const streams = await jackettio.getStreams(
             Object.assign(JSON.parse(atob(req.params.userConfig)), {
                 ip: req.clientIp,
@@ -311,6 +659,10 @@ app.get("/stream/:type/:id.json", async (req, res) => {
     });
 });
 
+// Route handler: Process download requests for torrents
+// Handles both IMDB IDs (tt*) and custom meta IDs (jkt*)
+// Creates torrent infos if needed, then generates RealDebrid download links
+// Redirects to the final download URL or error video on failure
 app.use(
     "/:userConfig/download/:type/:id/:torrentId/:name?",
     async (req, res, next) => {
@@ -319,12 +671,61 @@ app.use(
         }
 
         try {
+            const stremioId = req.params.id;
+            let actualStremioId = stremioId;
+
+            // For jkt IDs from catalog, create torrent infos first if meta is available
+            if (stremioId.startsWith("jkt")) {
+                const storedMeta = torrentMetaStore.get(stremioId);
+
+                if (storedMeta && storedMeta._link) {
+                    console.log(
+                        `${stremioId} : Creating torrent infos for catalog item`
+                    );
+
+                    // Create/cache torrent infos from stored data
+                    await getTorrentInfos({
+                        link: storedMeta._link,
+                        id: req.params.torrentId,
+                        magnetUrl: storedMeta._magnetUrl || "",
+                        infoHash: storedMeta._infoHash || "",
+                        name: storedMeta.name,
+                        size: storedMeta.size,
+                    });
+
+                    // Use dummy stremio ID for movie/series without specific episode
+                    actualStremioId = `jkt:0:0`;
+                } else {
+                    console.log(
+                        `${stremioId} : Meta not found in store, checking if torrent info exists`
+                    );
+                    // Meta not found, but torrent info might already exist from previous request
+                    // Try to get torrent info - if it doesn't exist, getDownload will handle the error
+                    try {
+                        await getTorrentInfoById(req.params.torrentId);
+                        console.log(
+                            `${stremioId} : Torrent info found, proceeding with download`
+                        );
+                    } catch (err) {
+                        console.log(
+                            `${stremioId} : Torrent info not found, cannot proceed without meta`
+                        );
+                        return res
+                            .status(404)
+                            .send(
+                                "Torrent meta not found. Please search again from catalog."
+                            );
+                    }
+                    actualStremioId = `jkt:0:0`;
+                }
+            }
+
             const url = await jackettio.getDownload(
                 Object.assign(JSON.parse(atob(req.params.userConfig)), {
                     ip: req.clientIp,
                 }),
                 req.params.type,
-                req.params.id,
+                actualStremioId,
                 req.params.torrentId
             );
 
@@ -378,6 +779,8 @@ app.use(
     }
 );
 
+// Middleware: Handle 404 errors for unmatched routes
+// Returns JSON error for AJAX requests, plain text for regular requests
 app.use((req, res) => {
     if (req.xhr) {
         res.status(404).send({ error: "Page not found!" });
@@ -386,6 +789,9 @@ app.use((req, res) => {
     }
 });
 
+// Middleware: Global error handler for unhandled exceptions
+// Logs error stack trace to console and returns 500 error
+// Returns JSON error for AJAX requests, plain text for regular requests
 app.use((err, req, res, next) => {
     console.error(err.stack);
     if (req.xhr) {

@@ -21,6 +21,8 @@ services:
       - RUN_OPTS= #optional
     depends_on:
       - flaresolverr
+    ports:
+      - 9117:9117
     networks:
       - jackettio
     restart: unless-stopped

@@ -407,7 +407,8 @@ export async function getDownload(userConfig, type, stremioId, torrentId){
   try {
 
     // Prepare next expisode debrid cache
-    if(type == 'series' && userConfig.forceCacheNextEpisode){
+    // Skip meta lookup for jkt IDs (custom meta) - they don't have valid meta sources
+    if(type == 'series' && userConfig.forceCacheNextEpisode && !stremioId.startsWith('jkt')){
       getMetaInfos(type, stremioId, userConfig.metaLanguage).then(metaInfos => prepareNextEpisode(userConfig, metaInfos, debridInstance));
     }
 
