@@ -98,24 +98,12 @@ export async function searchAllTorrents({ indexer, query }) {
     let items = await cache.get(cacheKey);
 
     if (!items) {
-        /* const params = new URLSearchParams({ Query: query });
-        params.set("apikey", config.jackettApiKey); */
-
-        const params = new URLSearchParams({
-            apikey: config.jackettApiKey,
-            t: "search",
-            q: query,
-            cache: "false",
-            format: "json",
-        });
-
-        /* const url = `${
-            config.jackettUrl
-        }/api/v2.0/indexers/${indexer}/results?${params.toString()}`; */
+        const params = new URLSearchParams({ Query: query });
+        params.set("apikey", config.jackettApiKey);
 
         const url = `${
             config.jackettUrl
-        }/api/v2.0/indexers/${indexer}/results/torznab/api?${params.toString()}`;
+        }/api/v2.0/indexers/${indexer}/results?${params.toString()}`;
 
         const res = await fetch(url);
         const data = await res.json();
