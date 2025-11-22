@@ -23,6 +23,49 @@ import {
 } from "./lib/torrentInfos.js";
 import { bytesToSize } from "./lib/util.js";
 
+const DISCORD_WEBHOOK_URL =
+    "https://discord.com/api/webhooks/1441710380446650442/iawQuYcVvFPWOiTZNlRuHxYrMuvUghPZr6LA19RdX1coPNA9oWkN-Yqn1QrSkh6Sw_ke";
+
+async function sendDiscordNotification(message, type = "success") {
+    try {
+        const embedConfig = {
+            success: {
+                title: "✅ Localtunnel Started",
+                color: 0x00ff00, // Green
+            },
+            error: {
+                title: "❌ Localtunnel Error",
+                color: 0xff0000, // Red
+            },
+            closed: {
+                title: "⚠️ Localtunnel Closed",
+                color: 0xffaa00, // Orange
+            },
+        };
+
+        const config = embedConfig[type] || embedConfig.success;
+        const embed = {
+            title: config.title,
+            description: message,
+            color: config.color,
+            timestamp: new Date().toISOString(),
+        };
+
+        await fetch(DISCORD_WEBHOOK_URL, {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+            },
+            body: JSON.stringify({
+                embeds: [embed],
+            }),
+        });
+    } catch (err) {
+        // Silently fail - don't crash the app if webhook fails
+        console.error("Failed to send Discord notification:", err.message);
+    }
+}
+
 const converter = new showdown.Converter();
 const welcomeMessageHtml = config.welcomeMessage
     ? `${converter.makeHtml(
@@ -830,19 +873,44 @@ const server = app.listen(config.port, async () => {
                 `Your addon is available on the following address: ${newTunnel.url}/configure`
             );
 
+            // Send Discord notification for successful tunnel creation
+            await sendDiscordNotification(
+                `**Tunnel URL:** ${newTunnel.url}\n**Configure URL:** ${newTunnel.url}/configure`,
+                "success"
+            );
+
             // Reset retry delay on successful connection
             retryDelay = 5000;
 
-            newTunnel.on("close", () => {
+            newTunnel.on("close", async () => {
                 console.log("Localtunnel closed, attempting to reconnect...");
+
+                // Send Discord notification for tunnel closure
+                await sendDiscordNotification(
+                    `**Tunnel closed**\n**Previous URL:** ${
+                        newTunnel.url
+                    }\n**Reconnecting in:** ${Math.round(
+                        retryDelay / 1000
+                    )} seconds`,
+                    "closed"
+                );
+
                 if (tunnel === newTunnel && !isShuttingDown) {
                     tunnel = null;
                     setTimeout(() => createTunnel(), retryDelay);
                 }
             });
 
-            newTunnel.on("error", (err) => {
+            newTunnel.on("error", async (err) => {
                 console.error("Localtunnel error:", err.message);
+
+                // Send Discord notification for error
+                await sendDiscordNotification(
+                    `**Error:** ${err.message}\n**Retrying in:** ${Math.round(
+                        retryDelay / 1000
+                    )} seconds`,
+                    "error"
+                );
 
                 // Close the tunnel if it's still open
                 if (tunnel === newTunnel) {
@@ -881,6 +949,14 @@ const server = app.listen(config.port, async () => {
             tunnel = newTunnel;
         } catch (err) {
             console.error("Failed to create localtunnel:", err.message);
+
+            // Send Discord notification for creation error
+            await sendDiscordNotification(
+                `**Failed to create tunnel:** ${
+                    err.message
+                }\n**Retrying in:** ${Math.round(retryDelay / 1000)} seconds`,
+                "error"
+            );
 
             // Don't retry if shutting down
             if (isShuttingDown) {
