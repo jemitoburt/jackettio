@@ -808,16 +808,102 @@ const server = app.listen(config.port, async () => {
     console.log("───────────────────────────────────────");
 
     let tunnel;
+    let isRestarting = false;
+    let isShuttingDown = false;
+    let retryDelay = 5000; // Start with 5 seconds delay
+
+    async function createTunnel() {
+        if (isRestarting || isShuttingDown) return; // Prevent multiple simultaneous restarts or restarts during shutdown
+
+        try {
+            let subdomain = await cache.get("localtunnel:subdomain");
+            const newTunnel = await localtunnel({
+                port: config.port,
+                subdomain,
+            });
+
+            await cache.set("localtunnel:subdomain", newTunnel.clientId, {
+                ttl: 86400 * 365,
+            });
+
+            console.log(
+                `Your addon is available on the following address: ${newTunnel.url}/configure`
+            );
+
+            // Reset retry delay on successful connection
+            retryDelay = 5000;
+
+            newTunnel.on("close", () => {
+                console.log("Localtunnel closed, attempting to reconnect...");
+                if (tunnel === newTunnel && !isShuttingDown) {
+                    tunnel = null;
+                    setTimeout(() => createTunnel(), retryDelay);
+                }
+            });
+
+            newTunnel.on("error", (err) => {
+                console.error("Localtunnel error:", err.message);
+
+                // Close the tunnel if it's still open
+                if (tunnel === newTunnel) {
+                    tunnel = null;
+                    try {
+                        newTunnel.close();
+                    } catch (e) {
+                        // Ignore errors when closing
+                    }
+                }
+
+                // Don't restart if shutting down
+                if (isShuttingDown) {
+                    return;
+                }
+
+                console.log(
+                    `Attempting to restart tunnel in ${
+                        retryDelay / 1000
+                    } seconds...`
+                );
+
+                // Restart with exponential backoff (max 60 seconds)
+                isRestarting = true;
+                setTimeout(() => {
+                    isRestarting = false;
+                    if (!isShuttingDown) {
+                        createTunnel();
+                    }
+                }, retryDelay);
+
+                // Increase retry delay for next attempt (exponential backoff, capped at 60s)
+                retryDelay = Math.min(retryDelay * 1.5, 60000);
+            });
+
+            tunnel = newTunnel;
+        } catch (err) {
+            console.error("Failed to create localtunnel:", err.message);
+
+            // Don't retry if shutting down
+            if (isShuttingDown) {
+                return;
+            }
+
+            console.log(`Retrying in ${retryDelay / 1000} seconds...`);
+
+            isRestarting = true;
+            setTimeout(() => {
+                isRestarting = false;
+                if (!isShuttingDown) {
+                    createTunnel();
+                }
+            }, retryDelay);
+
+            // Increase retry delay for next attempt
+            retryDelay = Math.min(retryDelay * 1.5, 60000);
+        }
+    }
+
     if (config.localtunnel) {
-        let subdomain = await cache.get("localtunnel:subdomain");
-        tunnel = await localtunnel({ port: config.port, subdomain });
-        await cache.set("localtunnel:subdomain", tunnel.clientId, {
-            ttl: 86400 * 365,
-        });
-        console.log(
-            `Your addon is available on the following address: ${tunnel.url}/configure`
-        );
-        tunnel.on("close", () => console.log("tunnels are closed"));
+        await createTunnel();
     }
 
     icon.download().catch((err) =>
@@ -836,7 +922,14 @@ const server = app.listen(config.port, async () => {
 
     function closeGracefully(signal) {
         console.log(`Received signal to terminate: ${signal}`);
-        if (tunnel) tunnel.close();
+        isShuttingDown = true; // Prevent tunnel restarts during shutdown
+        if (tunnel) {
+            try {
+                tunnel.close();
+            } catch (e) {
+                // Ignore errors when closing
+            }
+        }
         intervals.forEach((interval) => clearInterval(interval));
         server.close(() => {
             console.log("Server closed");
