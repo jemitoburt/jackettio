@@ -412,7 +412,6 @@ app.get("/:userConfig?/catalog/:type/:id/:extra.json", async (req, res) => {
         );
 
         const results = await Promise.all(searchPromises);
-        console.log(results);
         const allTorrents = [].concat(...results);
 
         // Filter by quality preferences
