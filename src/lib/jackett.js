@@ -108,6 +108,8 @@ export async function searchAllTorrents({ indexer, query }) {
         const res = await fetch(url);
         const data = await res.json();
 
+        console.log(data);
+
         if (data.error) {
             throw new Error(
                 `jackettApi: ${url.replace(
