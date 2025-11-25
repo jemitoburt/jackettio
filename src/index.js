@@ -859,15 +859,29 @@ const server = app.listen(config.port, async () => {
         if (isRestarting || isShuttingDown) return; // Prevent multiple simultaneous restarts or restarts during shutdown
 
         try {
-            let subdomain = await cache.get("localtunnel:subdomain");
-            const newTunnel = await localtunnel({
+            const cachedSubdomain = await cache.get("localtunnel:subdomain");
+            const tunnelOptions = {
                 port: config.port,
-                subdomain,
-            });
+            };
 
-            await cache.set("localtunnel:subdomain", newTunnel.clientId, {
-                ttl: 86400 * 365,
-            });
+            const requestedSubdomain =
+                config.localtunnelSubdomain || cachedSubdomain;
+
+            if (requestedSubdomain) {
+                tunnelOptions.subdomain = requestedSubdomain;
+            }
+
+            if (config.localtunnelHost) {
+                tunnelOptions.host = config.localtunnelHost;
+            }
+
+            const newTunnel = await localtunnel(tunnelOptions);
+
+            if (!config.localtunnelSubdomain) {
+                await cache.set("localtunnel:subdomain", newTunnel.clientId, {
+                    ttl: 86400 * 365,
+                });
+            }
 
             console.log(
                 `Your addon is available on the following address: ${newTunnel.url}/configure`

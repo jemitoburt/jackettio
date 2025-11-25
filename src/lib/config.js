@@ -15,6 +15,10 @@ export default {
     dataFolder: process.env.DATA_FOLDER || "/tmp",
     // Enable localtunnel feature
     localtunnel: (process.env.LOCALTUNNEL || "false") === "true",
+    // Request a specific subdomain when opening the localtunnel
+    localtunnelSubdomain: process.env.LOCALTUNNEL_SUBDOMAIN || "",
+    // Override the localtunnel host (defaults to https://localtunnel.me)
+    localtunnelHost: process.env.LOCALTUNNEL_HOST || "",
     // Addon ID
     addonId: process.env.ADDON_ID || "community.stremio.jackettio",
     // Addon Name
