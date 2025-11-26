@@ -853,10 +853,28 @@ const server = app.listen(config.port, async () => {
     let tunnel;
     let isRestarting = false;
     let isShuttingDown = false;
-    let retryDelay = 5000; // Start with 5 seconds delay
+    let retryDelay = 10000; // Start with 10 seconds delay
+    let retryTimeout = null;
 
     async function createTunnel() {
         if (isRestarting || isShuttingDown) return; // Prevent multiple simultaneous restarts or restarts during shutdown
+
+        // Clear any pending retry
+        if (retryTimeout) {
+            clearTimeout(retryTimeout);
+            retryTimeout = null;
+        }
+
+        // Clean up old tunnel before creating new one
+        if (tunnel) {
+            try {
+                tunnel.removeAllListeners();
+                tunnel.close();
+            } catch (e) {
+                // Ignore errors when closing
+            }
+            tunnel = null;
+        }
 
         try {
             const cachedSubdomain = await cache.get("localtunnel:subdomain");
@@ -883,6 +901,66 @@ const server = app.listen(config.port, async () => {
                 });
             }
 
+            // Verify tunnel is actually accessible
+            console.log(
+                `Verifying tunnel accessibility: ${newTunnel.url}/configure`
+            );
+
+            try {
+                const response = await fetch(`${newTunnel.url}/configure`, {
+                    method: "HEAD",
+                    signal: AbortSignal.timeout(10000), // 10 second timeout
+                });
+
+                if (response.status === 503) {
+                    throw new Error(
+                        "Tunnel Unavailable (503) - tunnel not set up correctly"
+                    );
+                }
+
+                if (!response.ok && response.status !== 404) {
+                    // 404 is OK since /configure might not be ready yet
+                    console.warn(
+                        `Tunnel responded with status ${response.status}, but continuing...`
+                    );
+                }
+            } catch (verifyError) {
+                // If verification fails, close this tunnel and retry
+                console.error(
+                    `Tunnel verification failed: ${verifyError.message}`
+                );
+
+                try {
+                    newTunnel.removeAllListeners();
+                    newTunnel.close();
+                } catch (e) {
+                    // Ignore errors when closing
+                }
+
+                // Don't set tunnel variable, let it retry
+                if (isShuttingDown) {
+                    return;
+                }
+
+                console.log(
+                    `Retrying tunnel creation in ${
+                        retryDelay / 1000
+                    } seconds...`
+                );
+
+                isRestarting = true;
+                retryTimeout = setTimeout(() => {
+                    isRestarting = false;
+                    if (!isShuttingDown) {
+                        createTunnel();
+                    }
+                }, retryDelay);
+
+                // Increase retry delay for next attempt
+                retryDelay = Math.min(retryDelay * 1.5, 120000);
+                return;
+            }
+
             console.log(
                 `Your addon is available on the following address: ${newTunnel.url}/configure`
             );
@@ -894,29 +972,43 @@ const server = app.listen(config.port, async () => {
             );
 
             // Reset retry delay on successful connection
-            retryDelay = 5000;
+            retryDelay = 10000;
 
             newTunnel.on("close", async () => {
-                console.log("Localtunnel closed, attempting to reconnect...");
+                // Only reconnect if this is still the active tunnel and not already restarting
+                if (tunnel === newTunnel && !isShuttingDown && !isRestarting) {
+                    console.log(
+                        "Localtunnel closed, attempting to reconnect..."
+                    );
 
-                // Send Discord notification for tunnel closure
-                await sendDiscordNotification(
-                    `**Tunnel closed**\n**Previous URL:** ${
-                        newTunnel.url
-                    }\n**Reconnecting in:** ${Math.round(
-                        retryDelay / 1000
-                    )} seconds`,
-                    "closed"
-                );
+                    // Send Discord notification for tunnel closure
+                    await sendDiscordNotification(
+                        `**Tunnel closed**\n**Previous URL:** ${
+                            newTunnel.url
+                        }\n**Reconnecting in:** ${Math.round(
+                            retryDelay / 1000
+                        )} seconds`,
+                        "closed"
+                    );
 
-                if (tunnel === newTunnel && !isShuttingDown) {
                     tunnel = null;
-                    setTimeout(() => createTunnel(), retryDelay);
+                    isRestarting = true;
+                    retryTimeout = setTimeout(() => {
+                        isRestarting = false;
+                        if (!isShuttingDown) {
+                            createTunnel();
+                        }
+                    }, retryDelay);
                 }
             });
 
             newTunnel.on("error", async (err) => {
                 console.error("Localtunnel error:", err.message);
+
+                // Only handle if this is still the active tunnel
+                if (tunnel !== newTunnel) {
+                    return;
+                }
 
                 // Send Discord notification for error
                 await sendDiscordNotification(
@@ -926,14 +1018,15 @@ const server = app.listen(config.port, async () => {
                     "error"
                 );
 
-                // Close the tunnel if it's still open
-                if (tunnel === newTunnel) {
-                    tunnel = null;
-                    try {
-                        newTunnel.close();
-                    } catch (e) {
-                        // Ignore errors when closing
-                    }
+                // Mark as restarting to prevent close handler from also triggering
+                isRestarting = true;
+                tunnel = null;
+
+                try {
+                    newTunnel.removeAllListeners();
+                    newTunnel.close();
+                } catch (e) {
+                    // Ignore errors when closing
                 }
 
                 // Don't restart if shutting down
@@ -947,17 +1040,16 @@ const server = app.listen(config.port, async () => {
                     } seconds...`
                 );
 
-                // Restart with exponential backoff (max 60 seconds)
-                isRestarting = true;
-                setTimeout(() => {
+                // Restart with exponential backoff (max 2 minutes)
+                retryTimeout = setTimeout(() => {
                     isRestarting = false;
                     if (!isShuttingDown) {
                         createTunnel();
                     }
                 }, retryDelay);
 
-                // Increase retry delay for next attempt (exponential backoff, capped at 60s)
-                retryDelay = Math.min(retryDelay * 1.5, 60000);
+                // Increase retry delay for next attempt (exponential backoff, capped at 2 min)
+                retryDelay = Math.min(retryDelay * 1.5, 120000);
             });
 
             tunnel = newTunnel;
@@ -980,7 +1072,7 @@ const server = app.listen(config.port, async () => {
             console.log(`Retrying in ${retryDelay / 1000} seconds...`);
 
             isRestarting = true;
-            setTimeout(() => {
+            retryTimeout = setTimeout(() => {
                 isRestarting = false;
                 if (!isShuttingDown) {
                     createTunnel();
@@ -988,7 +1080,7 @@ const server = app.listen(config.port, async () => {
             }, retryDelay);
 
             // Increase retry delay for next attempt
-            retryDelay = Math.min(retryDelay * 1.5, 60000);
+            retryDelay = Math.min(retryDelay * 1.5, 120000);
         }
     }
 
@@ -1013,8 +1105,16 @@ const server = app.listen(config.port, async () => {
     function closeGracefully(signal) {
         console.log(`Received signal to terminate: ${signal}`);
         isShuttingDown = true; // Prevent tunnel restarts during shutdown
+
+        // Clear any pending retry
+        if (retryTimeout) {
+            clearTimeout(retryTimeout);
+            retryTimeout = null;
+        }
+
         if (tunnel) {
             try {
+                tunnel.removeAllListeners();
                 tunnel.close();
             } catch (e) {
                 // Ignore errors when closing
