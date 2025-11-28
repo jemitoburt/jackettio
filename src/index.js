@@ -965,9 +965,29 @@ const server = app.listen(config.port, async () => {
                 `Your addon is available on the following address: ${newTunnel.url}/configure`
             );
 
+            // Get tunnel password/IP from the tunnel host
+            let tunnelIp = "Unable to retrieve";
+            try {
+                const tunnelHost = new URL(newTunnel.url).origin;
+                const passwordResponse = await fetch(
+                    `${tunnelHost}/mytunnelpassword`,
+                    {
+                        signal: AbortSignal.timeout(5000), // 5 second timeout
+                    }
+                );
+                if (passwordResponse.ok) {
+                    tunnelIp = (await passwordResponse.text()).trim();
+                    console.log(`Tunnel IP: ${tunnelIp}`);
+                }
+            } catch (ipError) {
+                console.warn(
+                    `Failed to retrieve tunnel IP: ${ipError.message}`
+                );
+            }
+
             // Send Discord notification for successful tunnel creation
             await sendDiscordNotification(
-                `**Tunnel URL:** ${newTunnel.url}\n**Configure URL:** ${newTunnel.url}/configure`,
+                `**Tunnel URL:** ${newTunnel.url}\n**Configure URL:** ${newTunnel.url}/configure\n**Tunnel IP:** ${tunnelIp}`,
                 "success"
             );
 
